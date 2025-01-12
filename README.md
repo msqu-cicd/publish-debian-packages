@@ -18,7 +18,7 @@ This Action uploads Debian packages to a Forgejo repository.
 
 ```yaml
   - name: Upload Debian Packages
-    uses: https://github.com/neonmaus/forgejo-publish-debian-packages@v1
+    uses: https://git.msqu.de/cicd/publish_debian_packages.git@main
     with:
       deb_files: 'path/to/package1.deb path/to/package2.deb'
       overwrite: false
