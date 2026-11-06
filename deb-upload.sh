@@ -1,112 +1,163 @@
-#!/bin/env bash
+#!/usr/bin/env bash
+
+set -u
 
 # Check if all required environment variables are set
-if [ -z "$USER" ]; then
-  echo "Error: The environment variable USER is not set."
+if [ -z "${FORGEJO_USER:-}" ]; then
+  echo "Error: The environment variable FORGEJO_USER is not set." >&2
   exit 1
 fi
 
-if [ -z "$TOKEN" ]; then
-  echo "Error: The environment variable TOKEN is not set."
+if [ -z "${TOKEN:-}" ]; then
+  echo "Error: The environment variable TOKEN is not set." >&2
   exit 1
 fi
 
-if [ -z "$FORGEJO_SERVER_URL" ]; then
-  echo "Error: The environment variable FORGEJO_SERVER_URL is not set."
+if [ -z "${FORGEJO_SERVER_URL:-}" ]; then
+  echo "Error: The environment variable FORGEJO_SERVER_URL is not set." >&2
   exit 1
 fi
 
-if [ -z "$DIST" ]; then
-  echo "Error: The environment variable DIST is not set."
+if [ -z "${DIST:-}" ]; then
+  echo "Error: The environment variable DIST is not set." >&2
   exit 1
 fi
 
-if [ -z "$COMPONENT" ]; then
-  echo "Error: The environment variable COMPONENT is not set."
+if [ -z "${COMPONENT:-}" ]; then
+  echo "Error: The environment variable COMPONENT is not set." >&2
   exit 1
 fi
 
-if [ -z "$OVERWRITE" ]; then
-  echo "Error: The environment variable OVERWRITE is not set."
+if [ -z "${OVERWRITE:-}" ]; then
+  echo "Error: The environment variable OVERWRITE is not set." >&2
   exit 1
 fi
 
-REPO_URL="$FORGEJO_SERVER_URL/api/packages/$USER/debian/pool/$DIST/$COMPONENT"
+OVERWRITE=${OVERWRITE,,}
+case "$OVERWRITE" in
+  true | false) ;;
+  *)
+    echo "Error: OVERWRITE must be 'true' or 'false', got: $OVERWRITE" >&2
+    exit 1
+    ;;
+esac
 
-# Function to check if the version already exists in the repository
-check_version_exists() {
-  local package_name=$1
-  local package_version=$2
-  local arch=$3
-  local check_url="$REPO_URL/${package_name}_${package_version}_${arch}.deb"
-  
-  echo "Checking if the version already exists: $check_url"
-  local http_status
-  http_status=$(curl --user "$USER":"$TOKEN" -s -o /dev/null -w "%{http_code}" "$check_url")
-  
-  echo "HTTP Status: $http_status"
-  if [ "$http_status" -eq 200 ]; then
-    return 0  # Version exists
-  else
-    return 1  # Version does not exist
-  fi
+REPO_URL="$FORGEJO_SERVER_URL/api/packages/$FORGEJO_USER/debian/pool/$DIST/$COMPONENT"
+
+# curl wrapper that passes the credentials via a config file on stdin
+# instead of the command line, where other processes could read them.
+curl_auth() {
+  curl --silent --show-error --config - "$@" <<EOF
+user = "$FORGEJO_USER:$TOKEN"
+EOF
 }
 
-# Function to delete the existing version
+# Function to delete an existing version
+# https://forgejo.org/docs/latest/user/packages/debian/
 delete_version() {
   local package_name=$1
   local package_version=$2
   local arch=$3
   local delete_url="$REPO_URL/$package_name/$package_version/$arch"
-  
+  local http_status
+
   echo "Deleting existing version: $delete_url"
-  curl --user "$USER":"$TOKEN" -X DELETE "$delete_url"
+  if ! http_status=$(curl_auth -o /dev/null -w '%{http_code}' -X DELETE "$delete_url"); then
+    echo "Error: DELETE request failed for $delete_url" >&2
+    return 1
+  fi
+
+  if [ "$http_status" != "204" ]; then
+    echo "Error: deleting $delete_url failed with HTTP status $http_status." >&2
+    return 1
+  fi
 }
 
-# Function to upload the new version
+# Function to upload a package.
+# Returns 0 on success, 2 if the version already exists (HTTP 409),
+# and 1 on any other failure.
 upload_package() {
   local deb_file=$1
   local upload_url="$REPO_URL/upload"
-  
-  echo "Uploading new version: $upload_url"
-  curl --user "$USER":"$TOKEN" --upload-file "$deb_file" "$upload_url"
-  echo "Upload of $deb_file completed."
+  local http_status
+
+  echo "Uploading: $deb_file to $upload_url"
+  if ! http_status=$(curl_auth -o /dev/null -w '%{http_code}' --upload-file "$deb_file" "$upload_url"); then
+    echo "Error: upload request failed for $deb_file" >&2
+    return 1
+  fi
+
+  case "$http_status" in
+    201)
+      echo "Upload of $deb_file completed."
+      return 0
+      ;;
+    409)
+      return 2
+      ;;
+    *)
+      echo "Error: upload of $deb_file failed with HTTP status $http_status." >&2
+      return 1
+      ;;
+  esac
 }
 
 # Check if at least one .deb file is provided as an argument
 if [ "$#" -lt 1 ]; then
-  echo "Usage: $0 <deb-file1> <deb-file2> ..."
+  echo "Usage: $0 <deb-file1> <deb-file2> ..." >&2
   exit 1
 fi
+
+FAILED=0
 
 # Process each provided .deb file
 for DEB_FILE in "$@"; do
   echo "Processing file: $DEB_FILE"
 
-  # Extract the filename from the path
-  FILE_NAME=$(basename "$DEB_FILE")
+  if [ ! -f "$DEB_FILE" ]; then
+    echo "Error: file not found: $DEB_FILE" >&2
+    FAILED=1
+    echo "----------------------------------------"
+    continue
+  fi
 
-  # Extract package name and version from the filename
-  PACKAGE_NAME=$(echo "$FILE_NAME" | cut -d'_' -f1)
-  PACKAGE_VERSION=$(echo "$FILE_NAME" | cut -d'_' -f2)
-  ARCH=$(echo "$FILE_NAME" | cut -d'_' -f3 | cut -d'-' -f1)
+  # Extract package name, version and architecture from the
+  # filename, which must follow the name_version_arch.deb scheme.
+  FILE_NAME=$(basename "$DEB_FILE")
+  BASE_NAME=${FILE_NAME%.deb}
+  PACKAGE_NAME=$(echo "$BASE_NAME" | cut -d'_' -f1)
+  PACKAGE_VERSION=$(echo "$BASE_NAME" | cut -d'_' -f2)
+  ARCH=$(echo "$BASE_NAME" | cut -d'_' -f3)
 
   echo "Package name: $PACKAGE_NAME"
   echo "Package version: $PACKAGE_VERSION"
   echo "Architecture: $ARCH"
 
-  # Check if the version already exists in the repository
-  if check_version_exists "$PACKAGE_NAME" "$PACKAGE_VERSION" "$ARCH"; then
-    if [ "$OVERWRITE" = true ]; then
-      delete_version "$PACKAGE_NAME" "$PACKAGE_VERSION" "$ARCH"
-      upload_package "$DEB_FILE"
+  upload_package "$DEB_FILE"
+  UPLOAD_RESULT=$?
+
+  if [ "$UPLOAD_RESULT" -eq 2 ]; then
+    # Version already exists in the repository
+    if [ "$OVERWRITE" = "true" ]; then
+      if [ -z "$PACKAGE_NAME" ] || [ -z "$PACKAGE_VERSION" ] || [ -z "$ARCH" ]; then
+        echo "Error: cannot overwrite $FILE_NAME, filename does not follow name_version_arch.deb." >&2
+        FAILED=1
+      elif ! delete_version "$PACKAGE_NAME" "$PACKAGE_VERSION" "$ARCH"; then
+        FAILED=1
+      else
+        if ! upload_package "$DEB_FILE"; then
+          echo "Error: re-upload of $DEB_FILE after deleting the existing version failed." >&2
+          FAILED=1
+        fi
+      fi
     else
       echo "Version exists. Overwrite is disabled. Skipping file: $DEB_FILE"
     fi
-  else
-    echo "Version does not exist. No deletion required."
-    upload_package "$DEB_FILE"
+  elif [ "$UPLOAD_RESULT" -ne 0 ]; then
+    FAILED=1
   fi
 
   echo "----------------------------------------"
 done
+
+exit "$FAILED"

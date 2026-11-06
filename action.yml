@@ -37,13 +37,16 @@ runs:
     - name: Run deb-upload.sh
       shell: bash
       env:
-        USER: ${{ inputs.forgejo_user }}
+        FORGEJO_USER: ${{ inputs.forgejo_user }}
         TOKEN: ${{ inputs.forgejo_token }}
         FORGEJO_SERVER_URL: ${{ inputs.forgejo_server_url }}
         DIST: ${{ inputs.dist }}
         COMPONENT: ${{ inputs.component }}
         OVERWRITE: ${{ inputs.overwrite }}
-      run: ${{ github.action_path }}/deb-upload.sh ${{ inputs.deb_files }}  
+        DEB_FILES: ${{ inputs.deb_files }}
+      run: |
+        read -r -d '' -a FILES <<< "$DEB_FILES" || true
+        "${{ github.action_path }}/deb-upload.sh" "${FILES[@]}"
 branding:
   icon: 'package'  
   color: 'red'
